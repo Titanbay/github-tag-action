@@ -23,7 +23,7 @@ patch_string_token=${PATCH_STRING_TOKEN:-#patch}
 none_string_token=${NONE_STRING_TOKEN:-#none}
 branch_history=${BRANCH_HISTORY:-compare}
 force_without_changes=${FORCE_WITHOUT_CHANGES:-false}
-force_without_changes_pre=${FORCE_WITHOUT_CHANGES:-false}
+force_without_changes_pre=${FORCE_WITHOUT_CHANGES_PRE:-false}
 tag_message=${TAG_MESSAGE:-""}
 
 # since https://github.blog/2022-04-12-git-security-vulnerability-announced/ runner uses?
@@ -122,6 +122,11 @@ matching_pre_tag_refs=$( (grep -E "$preTagFmt" <<< "$git_refs") || true)
 tag=$(head -n 1 <<< "$matching_tag_refs")
 pre_tag=$(head -n 1 <<< "$matching_pre_tag_refs")
 
+# returns 0 if the provided rev resolves to a commit, else 1
+rev_exists() {
+    git rev-parse -q --verify "${1}^{commit}" >/dev/null 2>&1
+}
+
 # if there are none, start tags at initial version
 if [ -z "$tag" ]
 then
@@ -132,8 +137,12 @@ then
     fi
 fi
 
-# get current commit hash for tag
-tag_commit=$(git rev-list -n 1 "$tag" || true )
+# get current commit hash for tag (only if it exists)
+tag_commit=""
+if rev_exists "$tag"
+then
+    tag_commit=$(git rev-list -n 1 "$tag")
+fi
 # get current commit hash
 commit=$(git rev-parse HEAD)
 # skip if there are no new commits for non-pre_release
@@ -160,10 +169,20 @@ then
 fi
 
 # get the merge commit message looking for #bumps
+compare_base_commit="$tag_commit"
+if $pre_release
+then
+    if rev_exists "$pre_tag"
+    then
+        compare_base_commit=$(git rev-list -n 1 "$pre_tag")
+    else
+        compare_base_commit=""
+    fi
+fi
 declare -A history_type=(
     ["last"]="$(git show -s --format=%B)" \
     ["full"]="$(git log "${default_branch}"..HEAD --format=%B)" \
-    ["compare"]="$(git log "${tag_commit}".."${commit}" --format=%B)" \
+    ["compare"]="$(if [ -n "$compare_base_commit" ]; then git log "${compare_base_commit}".."${commit}" --format=%B; else git log "${commit}" --format=%B; fi)" \
 )
 log=${history_type[${branch_history}]}
 printf "History:\n---\n%s\n---\n" "$log"
@@ -204,7 +223,11 @@ esac
 if $pre_release
 then
     # get current commit hash for tag
-    pre_tag_commit=$(git rev-list -n 1 "$pre_tag" || true)
+    pre_tag_commit=""
+    if rev_exists "$pre_tag"
+    then
+        pre_tag_commit=$(git rev-list -n 1 "$pre_tag")
+    fi
     # skip if there are no new commits for pre_release
     if [ "$pre_tag_commit" == "$commit" ] &&  [ "$force_without_changes_pre" == "false" ]
     then
@@ -237,7 +260,12 @@ fi
 setOutput "new_tag" "$new"
 setOutput "part" "$part"
 setOutput "tag" "$new" # this needs to go in v2 is breaking change
-setOutput "old_tag" "$tag"
+if $pre_release
+then
+    setOutput "old_tag" "$pre_tag"
+else
+    setOutput "old_tag" "$tag"
+fi
 
 # dry run exit without real changes
 if $dryrun
