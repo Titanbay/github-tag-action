@@ -86,6 +86,64 @@ echo "pre_release = $pre_release"
 # fetch tags
 git fetch --tags
 
+# escape a string for use in grep -E patterns
+escape_ere() {
+    # escape: ] [ \ - ^ $ . | ? * + ( ) { }
+    printf '%s' "$1" | sed -e 's/[][\\.^$|?*+(){}-]/\\&/g'
+}
+
+# returns 0 if the provided rev resolves to a commit, else 1
+rev_exists() {
+    git rev-parse -q --verify "${1}^{commit}" >/dev/null 2>&1
+}
+
+# bump a semver (no prefix) without requiring external tooling
+bump_semver_fallback() {
+    local part="$1"
+    local ver="$2"
+    if [[ ! "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        echo "::error::Invalid semver '${ver}'"
+        exit 1
+    fi
+    local maj="${BASH_REMATCH[1]}"
+    local min="${BASH_REMATCH[2]}"
+    local pat="${BASH_REMATCH[3]}"
+    case "$part" in
+        major) echo "$((maj+1)).0.0" ;;
+        minor) echo "${maj}.$((min+1)).0" ;;
+        patch) echo "${maj}.${min}.$((pat+1))" ;;
+        *) echo "::error::Unknown bump part '${part}'"; exit 1 ;;
+    esac
+}
+
+semver_bump() {
+    local part="$1"
+    local ver="$2"
+    if command -v semver >/dev/null 2>&1; then
+        semver -i "$part" "$ver"
+    else
+        bump_semver_fallback "$part" "$ver"
+    fi
+}
+
+next_prerelease_tag() {
+    # args: <prefix> <full-pre-tag> <suffix>
+    local prefix="$1"
+    local full_pre_tag="$2"
+    local preid="$3"
+
+    local ver="${full_pre_tag#"$prefix"}"
+    if [[ "$ver" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-${preid}\.([0-9]+)$ ]]; then
+        local base="${BASH_REMATCH[1]}"
+        local num="${BASH_REMATCH[2]}"
+        echo "${prefix}${base}-${preid}.$((num+1))"
+        return 0
+    fi
+
+    echo "::error::Unable to parse prerelease tag '${full_pre_tag}'"
+    exit 1
+}
+
 # Set no tag prefix (not even v)
 tagPrefix=""
 
@@ -100,17 +158,27 @@ then
   tagPrefix=$tag_prefix
 fi
 
-tagFmt="^$tagPrefix?[0-9]+\.[0-9]+\.[0-9]+$"
-preTagFmt="^$tagPrefix?[0-9]+\.[0-9]+\.[0-9]+(-$suffix\.[0-9]+)$"
+tagPrefixRe="$(escape_ere "$tagPrefix")"
+
+# For custom TAG_PREFIX, only match tags that start with that prefix.
+# For WITH_V=true (where tagPrefix="v"), allow matching both "v1.2.3" and "1.2.3".
+prefixGroup="$tagPrefixRe"
+if [[ "${tag_prefix}" == "false" ]] && [[ "$tagPrefix" == "v" ]]
+then
+    prefixGroup="(${tagPrefixRe})?"
+fi
+
+tagFmt="^${prefixGroup}[0-9]+\.[0-9]+\.[0-9]+$"
+preTagFmt="^${prefixGroup}[0-9]+\.[0-9]+\.[0-9]+-${suffix}\.[0-9]+$"
 
 # get the git refs
 git_refs=
 case "$tag_context" in
     *repo*)
-        git_refs=$(git for-each-ref --sort=-v:refname --format '%(refname:lstrip=2)')
+        git_refs=$(git tag --list --sort=-v:refname)
         ;;
     *branch*)
-        git_refs=$(git tag --list --merged HEAD --sort=-committerdate)
+        git_refs=$(git tag --list --merged HEAD --sort=-v:refname)
         ;;
     * ) echo "Unrecognised context"
         exit 1;;
@@ -121,11 +189,6 @@ matching_tag_refs=$( (grep -E "$tagFmt" <<< "$git_refs") || true)
 matching_pre_tag_refs=$( (grep -E "$preTagFmt" <<< "$git_refs") || true)
 tag=$(head -n 1 <<< "$matching_tag_refs")
 pre_tag=$(head -n 1 <<< "$matching_pre_tag_refs")
-
-# returns 0 if the provided rev resolves to a commit, else 1
-rev_exists() {
-    git rev-parse -q --verify "${1}^{commit}" >/dev/null 2>&1
-}
 
 # if there are none, start tags at initial version
 if [ -z "$tag" ]
@@ -191,12 +254,22 @@ if [ -z "$tagPrefix" ]
 then
   current_tag=${tag}
 else
-  current_tag="$(echo ${tag}| sed "s/${tagPrefix}//g")"
+  current_tag="${tag#"$tagPrefix"}"
 fi
+
+# If we're already in a prerelease stream (i.e., a pre_tag exists as a real tag),
+# continue by bumping only the prerelease number. This avoids re-deciding the base
+# version from the last merge messages, which is what you want for rc.0 -> rc.1.
+continuing_prerelease=false
+if $pre_release && rev_exists "$pre_tag"
+then
+    continuing_prerelease=true
+fi
+
 case "$log" in
-    *$major_string_token* ) new=${tagPrefix}$(semver -i major "${current_tag}"); part="major";;
-    *$minor_string_token* ) new=${tagPrefix}$(semver -i minor "${current_tag}"); part="minor";;
-    *$patch_string_token* ) new=${tagPrefix}$(semver -i patch "${current_tag}"); part="patch";;
+    *$major_string_token* ) new=${tagPrefix}$(semver_bump major "${current_tag}"); part="major";;
+    *$minor_string_token* ) new=${tagPrefix}$(semver_bump minor "${current_tag}"); part="minor";;
+    *$patch_string_token* ) new=${tagPrefix}$(semver_bump patch "${current_tag}"); part="patch";;
     *$none_string_token* )
         echo "Default bump was set to none. Skipping..."
         setOutput "old_tag" "$tag"
@@ -214,7 +287,7 @@ case "$log" in
             setOutput "part" "$default_semvar_bump"
             exit 0
         else
-            new=${tagPrefix}$(semver -i "${default_semvar_bump}" "${current_tag}")
+            new=${tagPrefix}$(semver_bump "${default_semvar_bump}" "${current_tag}")
             part=$default_semvar_bump
         fi
         ;;
@@ -236,10 +309,10 @@ then
         setOutput "tag" "$pre_tag"
         exit 0
     fi
-    # already a pre-release available, bump it
-    if [[ "$pre_tag" =~ $new ]] && [[ "$pre_tag" =~ $suffix ]]
+    # If we're continuing an existing prerelease stream, just bump rc.N -> rc.(N+1)
+    if $continuing_prerelease
     then
-        new=${tagPrefix}$(semver -i prerelease "${pre_tag}" --preid "${suffix}")
+        new=$(next_prerelease_tag "$tagPrefix" "$pre_tag" "$suffix")
         echo -e "Bumping ${suffix} pre-tag ${pre_tag}. New pre-tag ${new}"
     else
         new="${new}-${suffix}.0"
