@@ -144,6 +144,18 @@ next_prerelease_tag() {
     exit 1
 }
 
+# Returns 0 (true) if ver1 > ver2, 1 (false) otherwise.
+# Both arguments must be bare semver: X.Y.Z (no prefix).
+semver_gt() {
+    local IFS='.'
+    local -a a=($1) b=($2)
+    for i in 0 1 2; do
+        if (( ${a[i]:-0} > ${b[i]:-0} )); then return 0; fi
+        if (( ${a[i]:-0} < ${b[i]:-0} )); then return 1; fi
+    done
+    return 1  # equal → not greater
+}
+
 # Set no tag prefix (not even v)
 tagPrefix=""
 
@@ -257,13 +269,22 @@ else
   current_tag="${tag#"$tagPrefix"}"
 fi
 
-# If we're already in a prerelease stream (i.e., a pre_tag exists as a real tag),
-# continue by bumping only the prerelease number. This avoids re-deciding the base
-# version from the last merge messages, which is what you want for rc.0 -> rc.1.
+# Decide whether to continue an existing prerelease stream (bump rc.N → rc.N+1)
+# or start a fresh one from the next bumped version.
+# We only continue when the prerelease base version is strictly ahead of the
+# latest release tag — otherwise a newer release has landed and the old
+# prerelease stream is stale.
 continuing_prerelease=false
 if $pre_release && rev_exists "$pre_tag"
 then
-    continuing_prerelease=true
+    # Extract the base semver from the prerelease tag (e.g. "v0.1.0-rc.2" → "0.1.0")
+    pre_tag_base="${pre_tag#"$tagPrefix"}"
+    pre_tag_base="${pre_tag_base%%-*}"
+
+    if semver_gt "$pre_tag_base" "$current_tag"
+    then
+        continuing_prerelease=true
+    fi
 fi
 
 case "$log" in
